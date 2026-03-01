@@ -77,6 +77,7 @@ static int waitingOnDevice = 0;
 int SchedulerEntryPoint(void* arg)
 {
     // TODO: check for kernel mode
+    checkKernelMode("SchedulerEntryPoint");
 
     /* Disable interrupts */
     disableInterrupts();
@@ -108,6 +109,9 @@ int SchedulerEntryPoint(void* arg)
     enableInterrupts();
 
     /* TODO: Create a process for Messaging, then block on a wait until messaging exits.*/
+    int pid = k_spawn("MessagingTest00", MessagingEntryPoint, NULL, 4 * THREADS_MIN_STACK_SIZE, HIGHEST_PRIORITY);
+    int exitCode;
+    k_wait(&exitCode);
 
     k_exit(0);
 
@@ -253,8 +257,12 @@ static void InitializeHandlers()
      *
      * Also initialize the system call vector (systemCallVector).
      */
-
+    for (int i = 0; i < THREADS_MAX_SYSCALLS; i++)
+    {
+        systemCallVector[i] = nullsys;
+    }
 }
+
 
 /* an error method to handle invalid syscalls */
 static void nullsys(system_call_arguments_t* args)
