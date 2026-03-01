@@ -254,6 +254,11 @@ static void InitializeHandlers()
      * Also initialize the system call vector (systemCallVector).
      */
 
+    for (int i = 0; i < THREADS_MAX_SYSCALLS; i++)
+    {
+        systemCallVector[i] = nullsys;
+    }
+
 }
 
 /* an error method to handle invalid syscalls */
