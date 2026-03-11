@@ -41,6 +41,10 @@ struct mailbox
    MAILBOX_STATUS    status;
    int               slotSize;
    int               slotCount;
+   int				 active;
+
+   WaitingProcessPtr blockedSendList;
+   WaitingProcessPtr blockedReceiveList;
 };
 
 

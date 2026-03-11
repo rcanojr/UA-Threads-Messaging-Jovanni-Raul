@@ -88,6 +88,18 @@ int SchedulerEntryPoint(void* arg)
     /* Initialize the mail box table, slots, & other data structures.
      * Initialize int_vec and sys_vec, allocate mailboxes for interrupt
      * handlers.  Etc... */
+    //initialize device mboxes
+    devices[THREADS_CLOCK_DEVICE_ID].deviceMbox = mailbox_create(0, sizeof(int)); //initialize clock
+    for (int i = 0; i < THREADS_MAX_DEVICES; i++)
+    {
+        if (i != THREADS_CLOCK_DEVICE_ID)
+        {
+            devices[i].deviceMbox = mailbox_create(10, sizeof(int)); //other devices
+        }
+    }
+
+    //after creating device mboxes, update nexMailboxId
+    nextMailboxId = THREADS_MAX_DEVICES; //device mboxes should fill first THREADS_MAX_DEVICES slots
 
     /* Initialize the devices and their mailboxes. */
     /* Allocate mailboxes for use by the interrupt handlers.
@@ -129,10 +141,71 @@ int SchedulerEntryPoint(void* arg)
    ----------------------------------------------------------------------- */
 int mailbox_create(int slots, int slot_size)
 {
-    int newId = -1;
+    checkKernelMode("mailbox_create");
 
+    if (nextMailboxId >= MAXMBOX)
+    {
+        return -1; //returns if all mailboxes are in use or if no available mailboxes
+    }
 
-    return newId;
+    MAILBOX_TYPE type;
+    if (slots == 0)
+    {
+        type = MB_ZEROSLOT; //for 0slot mailboxes
+    }
+    else if (slots == 1)
+    {
+        type = MB_SINGLESLOT; //for single slot mailboexes
+    }
+    else
+    {
+        type = MB_MULTISLOT; //for multislot mailboxes
+    }
+    
+    //initialize the mailbox
+    int id = nextMailboxId;
+    mailboxes[id].mbox_id = id;
+    mailboxes[id].type = type;
+    mailboxes[id].status = MBSTATUS_INUSE;
+    mailboxes[id].slotSize = slot_size;
+    mailboxes[id].slotCount = slots;
+    mailboxes[id].pSlotListHead = NULL;
+
+    
+    //creates the slots for multi slot mboxes
+    if (type == MB_MULTISLOT)
+    {
+        SlotPtr prevSlot = NULL;
+
+        for (int i = 0; i < slots; i++)
+        {
+            SlotPtr newSlot = malloc(sizeof(MailSlot)); //alloc new slot
+            if (!newSlot)
+            {
+                return -1; //occurs during malloc failure
+            }
+
+            newSlot->mbox_id = id;
+            newSlot->messageSize = 0;
+            newSlot->pNextSlot = NULL;
+            newSlot->pPrevSlot = prevSlot;
+
+            if (prevSlot)
+            {
+                prevSlot->pNextSlot = newSlot;
+            }
+            else
+            {
+                mailboxes[id].pSlotListHead = newSlot; //first slot initializes the head
+            }
+            
+            prevSlot = newSlot; //move to next slot
+        }
+    }
+
+    nextMailboxId++; //increments the mailbox id counter
+
+    return id;
 } /* mailbox_create */
 
 
@@ -148,9 +221,56 @@ int mailbox_create(int slots, int slot_size)
    ----------------------------------------------------------------------- */
 int mailbox_send(int mboxId, void* pMsg, int msg_size, int wait)
 {
-    int result = -1;
+    // Validate mailbox ID
+    if (mboxId < 0 || mboxId >= MAXMBOX)
+        return -1;
 
-    return result;
+    // Get the mailbox
+    MailBox* mb = &mailboxes[mboxId];
+
+    // Ensure the mailbox is active and not released
+    if (mb->status == MBSTATUS_RELEASED)
+        return -1;
+
+    // Check if the message size exceeds the slot size
+    if (msg_size > mb->slotSize)
+        return -1;  // Message is too large for the slot
+
+    // Try to find an empty slot to place the message
+    for (SlotPtr slot = mb->pSlotListHead; slot != NULL; slot = slot->pNextSlot)
+    {
+        if (slot->messageSize == 0)  // Empty slot found
+        {
+            // Copy the message into the slot
+            memcpy(slot->message, pMsg, msg_size);
+            slot->messageSize = msg_size;  // Mark the slot with the message size
+            return 0;  // Successfully sent the message
+        }
+    }
+
+    // If no slot is available and not blocking, return -2
+    if (!wait)
+        return -2;
+
+    // Block the sending process by adding it to the blocked list
+    WaitingProcess* newProcess = malloc(sizeof(WaitingProcess));
+    if (!newProcess)
+        return -1;  // Memory allocation failed
+
+    newProcess->pNextProcess = NULL;
+
+    // Add the new process to the blocked send list
+    if (mb->blockedSendList == NULL)
+        mb->blockedSendList = newProcess;
+    else
+    {
+        WaitingProcess* temp = mb->blockedSendList;
+        while (temp->pNextProcess != NULL)
+            temp = temp->pNextProcess;
+        temp->pNextProcess = newProcess;
+    }
+
+    return -5;  // Blocked sending
 }
 
 /* ------------------------------------------------------------------------
@@ -165,11 +285,58 @@ int mailbox_send(int mboxId, void* pMsg, int msg_size, int wait)
    ----------------------------------------------------------------------- */
 int mailbox_receive(int mboxId, void* pMsg, int msg_size, int wait)
 {
-    int result = -1;
+    if (mboxId < 0 || mboxId >= MAXMBOX)
+        return -1;
+    
+    MailBox* mb = &mailboxes[mboxId];
+    if (mb->status == MBSTATUS_RELEASED)
+        return -1;
+    if (msg_size < mb->slotSize)
+        return -1;
 
-    return result;
+    SlotPtr slot = mb->pSlotListHead;
+    while (slot != NULL)
+    {
+        if (slot->messageSize > 0)
+        {
+            memcpy(pMsg, slot->message, slot->messageSize);
+            int msgSize = slot->messageSize;
+            slot->messageSize = 0;
+
+            if (mb->blockedReceiveList != NULL)
+            {
+                WaitingProcess* blockedProcess = mb->blockedReceiveList;
+                mb->blockedReceiveList = blockedProcess->pNextProcess;
+                free(blockedProcess);
+            }
+            return msgSize;
+        }
+        slot = slot->pNextSlot;
+    }
+    if (!wait)
+        return -2;
+
+    WaitingProcess* newProcess = malloc(sizeof(WaitingProcess));
+    if (!newProcess)
+        return -1;
+
+    newProcess->pNextProcess = NULL;
+
+    if (mb->blockedReceiveList == NULL)
+    {
+        mb->blockedReceiveList = newProcess;
+    }
+    else
+    {
+        WaitingProcess* temp = mb->blockedReceiveList;
+        while (temp->pNextProcess != NULL)
+        {
+            temp = temp->pNextProcess;
+        }
+        temp->pNextProcess = newProcess;
+    }
+    return -5;
 }
-
 /* ------------------------------------------------------------------------
    Name - mailbox_free
    Purpose - Frees a previously created mailbox. Any process waiting on
@@ -257,10 +424,12 @@ static void InitializeHandlers()
      *
      * Also initialize the system call vector (systemCallVector).
      */
+
     for (int i = 0; i < THREADS_MAX_SYSCALLS; i++)
     {
         systemCallVector[i] = nullsys;
     }
+
 }
 
 
