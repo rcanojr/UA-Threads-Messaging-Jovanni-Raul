@@ -221,56 +221,65 @@ int mailbox_create(int slots, int slot_size)
    ----------------------------------------------------------------------- */
 int mailbox_send(int mboxId, void* pMsg, int msg_size, int wait)
 {
-    // Validate mailbox ID
-    if (mboxId < 0 || mboxId >= MAXMBOX)
-        return -1;
-
-    // Get the mailbox
-    MailBox* mb = &mailboxes[mboxId];
-
-    // Ensure the mailbox is active and not released
-    if (mb->status == MBSTATUS_RELEASED)
-        return -1;
-
-    // Check if the message size exceeds the slot size
-    if (msg_size > mb->slotSize)
-        return -1;  // Message is too large for the slot
-
-    // Try to find an empty slot to place the message
-    for (SlotPtr slot = mb->pSlotListHead; slot != NULL; slot = slot->pNextSlot)
+    while (1)
     {
-        if (slot->messageSize == 0)  // Empty slot found
+        // Validate mailbox ID
+        if (mboxId < 0 || mboxId >= MAXMBOX)
+            return -1;
+
+        // Get the mailbox
+        MailBox* mb = &mailboxes[mboxId];
+
+        // Ensure the mailbox is active and not released
+        if (mb->status == MBSTATUS_RELEASED)
+            return -1;
+
+        // Check if the message size exceeds the slot size
+        if (msg_size > mb->slotSize)
+            return -1;  // Message is too large for the slot
+
+        // Try to find an empty slot to place the message
+        for (SlotPtr slot = mb->pSlotListHead; slot != NULL; slot = slot->pNextSlot)
         {
-            // Copy the message into the slot
-            memcpy(slot->message, pMsg, msg_size);
-            slot->messageSize = msg_size;  // Mark the slot with the message size
-            return 0;  // Successfully sent the message
+            if (slot->messageSize == 0)  // Empty slot found
+            {
+                // Copy the message into the slot
+                memcpy(slot->message, pMsg, msg_size);
+                slot->messageSize = msg_size;  // Mark the slot with the message size
+                return 0;  // Successfully sent the message
+            }
         }
+
+        // If no slot is available and not blocking, return -2
+        if (!wait)
+            return -2;
+
+        // Block the sending process by adding it to the blocked list
+        WaitingProcess* newProcess = malloc(sizeof(WaitingProcess));
+        if (!newProcess)
+            return -1;  // Memory allocation failed
+
+        newProcess->pNextProcess = NULL;
+        newProcess->pPrevProcess = NULL;
+        newProcess->pid = k_getpid();
+        // Add the new process to the blocked send list
+        if (mb->blockedSendList == NULL)
+            mb->blockedSendList = newProcess;
+        else
+        {
+            WaitingProcess* temp = mb->blockedSendList;
+            while (temp->pNextProcess != NULL)
+                temp = temp->pNextProcess;
+            temp->pNextProcess = newProcess;
+            newProcess->pPrevProcess = temp;
+        }
+        block(BLOCKED_SEND);
+
+        if (signaled())
+            return -5;
+        //return -5;  // Blocked sending
     }
 
-    // If no slot is available and not blocking, return -2
-    if (!wait)
-        return -2;
-
-    // Block the sending process by adding it to the blocked list
-    WaitingProcess* newProcess = malloc(sizeof(WaitingProcess));
-    if (!newProcess)
-        return -1;  // Memory allocation failed
-
-    newProcess->pNextProcess = NULL;
-
-    // Add the new process to the blocked send list
-    if (mb->blockedSendList == NULL)
-        mb->blockedSendList = newProcess;
-    else
-    {
-        WaitingProcess* temp = mb->blockedSendList;
-        while (temp->pNextProcess != NULL)
-            temp = temp->pNextProcess;
-        temp->pNextProcess = newProcess;
-    }
-
-    return -5;  // Blocked sending
 }
 
 /* ------------------------------------------------------------------------
@@ -285,57 +294,78 @@ int mailbox_send(int mboxId, void* pMsg, int msg_size, int wait)
    ----------------------------------------------------------------------- */
 int mailbox_receive(int mboxId, void* pMsg, int msg_size, int wait)
 {
-    if (mboxId < 0 || mboxId >= MAXMBOX)
-        return -1;
-    
-    MailBox* mb = &mailboxes[mboxId];
-    if (mb->status == MBSTATUS_RELEASED)
-        return -1;
-    if (msg_size < mb->slotSize)
-        return -1;
-
-    SlotPtr slot = mb->pSlotListHead;
-    while (slot != NULL)
+    while (1)
     {
-        if (slot->messageSize > 0)
-        {
-            memcpy(pMsg, slot->message, slot->messageSize);
-            int msgSize = slot->messageSize;
-            slot->messageSize = 0;
+        if (mboxId < 0 || mboxId >= MAXMBOX)
+            return -1;
 
-            if (mb->blockedReceiveList != NULL)
+        MailBox* mb = &mailboxes[mboxId];
+        if (mb->status == MBSTATUS_RELEASED)
+            return -1;
+        if (msg_size < mb->slotSize)
+            return -1;
+
+        SlotPtr slot = mb->pSlotListHead;
+        while (slot != NULL)
+        {
+            if (slot->messageSize > 0)
             {
-                WaitingProcess* blockedProcess = mb->blockedReceiveList;
-                mb->blockedReceiveList = blockedProcess->pNextProcess;
-                free(blockedProcess);
+                int receivedSize = slot->messageSize;
+                memcpy(pMsg, slot->message, receivedSize);
+                SlotPtr cur = slot;
+                while (cur->pNextSlot != NULL && cur->pNextSlot->messageSize > 0)
+                {
+                    memcpy(cur->message, cur->pNextSlot->message, cur->pNextSlot->messageSize);
+                    cur->messageSize = cur->pNextSlot->messageSize;
+                    cur = cur->pNextSlot;
+                }
+                cur->messageSize = 0;
+
+                if (mb->blockedSendList != NULL)
+                {
+                    WaitingProcess* blockedProcess = mb->blockedSendList;
+                    mb->blockedSendList = blockedProcess->pNextProcess;
+
+                    if (mb->blockedSendList != NULL)
+                        mb->blockedSendList->pPrevProcess = NULL;
+
+                    unblock(blockedProcess->pid);
+                    free(blockedProcess);
+                }
+                return receivedSize;
             }
-            return msgSize;
+            slot = slot->pNextSlot;
         }
-        slot = slot->pNextSlot;
-    }
-    if (!wait)
-        return -2;
+        if (!wait)
+            return -2;
 
-    WaitingProcess* newProcess = malloc(sizeof(WaitingProcess));
-    if (!newProcess)
-        return -1;
+        WaitingProcess* newProcess = malloc(sizeof(WaitingProcess));
+        if (!newProcess)
+            return -1;
 
-    newProcess->pNextProcess = NULL;
+        newProcess->pNextProcess = NULL;
+        newProcess->pPrevProcess = NULL;
+        newProcess->pid = k_getpid();
 
-    if (mb->blockedReceiveList == NULL)
-    {
-        mb->blockedReceiveList = newProcess;
-    }
-    else
-    {
-        WaitingProcess* temp = mb->blockedReceiveList;
-        while (temp->pNextProcess != NULL)
+        if (mb->blockedReceiveList == NULL)
         {
-            temp = temp->pNextProcess;
+            mb->blockedReceiveList = newProcess;
         }
-        temp->pNextProcess = newProcess;
+        else
+        {
+            WaitingProcess* temp = mb->blockedReceiveList;
+            while (temp->pNextProcess != NULL)
+            {
+                temp = temp->pNextProcess;
+            }
+            temp->pNextProcess = newProcess;
+            newProcess->pPrevProcess = temp;
+        }
+        block(BLOCKED_RECEIVE);
+
+        if (signaled())
+            return -5;
     }
-    return -5;
 }
 /* ------------------------------------------------------------------------
    Name - mailbox_free
