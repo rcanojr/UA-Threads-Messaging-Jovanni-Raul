@@ -277,7 +277,9 @@ int mailbox_send(int mboxId, void* pMsg, int msg_size, int wait)
 
         if (signaled())
             return -5;
-        //return -5;  // Blocked sending
+
+        if (mb->status == MBSTATUS_RELEASED)
+            return -5;
     }
 
 }
@@ -365,7 +367,11 @@ int mailbox_receive(int mboxId, void* pMsg, int msg_size, int wait)
 
         if (signaled())
             return -5;
+
+        if (mb->status == MBSTATUS_RELEASED)
+            return -5;
     }
+    
 }
 /* ------------------------------------------------------------------------
    Name - mailbox_free
@@ -377,9 +383,42 @@ int mailbox_receive(int mboxId, void* pMsg, int msg_size, int wait)
    ----------------------------------------------------------------------- */
 int mailbox_free(int mboxId)
 {
-    int result = -1;
+    if (mboxId < 0 || mboxId >= MAXMBOX)
+        return -1;
 
-    return result;
+    MailBox* mb = &mailboxes[mboxId];
+
+    if (mb->status == MBSTATUS_RELEASED || mb->status != MBSTATUS_INUSE)
+        return -1;
+
+    mb->status = MBSTATUS_RELEASED;
+
+    while (mb->blockedSendList != NULL)
+    {
+        WaitingProcess* blockedProcess = mb->blockedSendList;
+        mb->blockedSendList = blockedProcess->pNextProcess;
+
+        if (mb->blockedSendList != NULL)
+            mb->blockedSendList->pPrevProcess = NULL;
+
+        k_kill(blockedProcess->pid, SIG_TERM);
+        unblock(blockedProcess->pid);
+        free(blockedProcess);
+    }
+
+    while (mb->blockedReceiveList != NULL)
+    {
+        WaitingProcess* blockedProcess = mb->blockedReceiveList;
+        mb->blockedReceiveList = blockedProcess->pNextProcess;
+
+        if (mb->blockedReceiveList != NULL)
+            mb->blockedReceiveList->pPrevProcess = NULL;
+
+        unblock(blockedProcess->pid);
+        free(blockedProcess);
+    }
+
+    return 0;
 }
 
 /* ------------------------------------------------------------------------
